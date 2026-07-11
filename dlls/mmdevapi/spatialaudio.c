@@ -19,6 +19,7 @@
 #define COBJMACROS
 
 #include <stdarg.h>
+#include <stdlib.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -79,6 +80,62 @@ static BOOL formats_equal(const WAVEFORMATEX *fmt1, const WAVEFORMATEX *fmt2)
     return !memcmp(fmt1, fmt2, sizeof(*fmt1)) && !memcmp(fmt1 + 1, fmt2 + 1, fmt1->cbSize);
 }
 
+/* Maximum number of dynamic spatial audio objects. On Windows a non-zero
+ * count is only reported when a spatial sound renderer such as Windows Sonic
+ * is enabled for the endpoint. WINE_SPATIAL_MAX_DYN overrides the default;
+ * 0 disables dynamic spatial audio support entirely. */
+#define DEFAULT_MAX_DYNAMIC_OBJECTS 112
+
+static UINT32 spatial_max_dynamic_objects(void)
+{
+    static LONG max_objects = -1;
+
+    if(max_objects < 0){
+        LONG value = DEFAULT_MAX_DYNAMIC_OBJECTS;
+        char buf[16];
+        DWORD len;
+
+        len = GetEnvironmentVariableA("WINE_SPATIAL_MAX_DYN", buf, sizeof(buf));
+        if(len && len < sizeof(buf)){
+            char *end;
+            ULONG parsed = strtoul(buf, &end, 10);
+            if(end != buf && !*end)
+                value = parsed > 1024 ? 1024 : parsed;
+            else
+                WARN("Ignoring invalid WINE_SPATIAL_MAX_DYN=%s\n", debugstr_a(buf));
+        }
+        TRACE("max dynamic object count: %ld\n", value);
+        max_objects = value;
+    }
+
+    return max_objects;
+}
+
+struct speaker_info {
+    AudioObjectType type;
+    DWORD speaker;
+    float azimuth; /* degrees, clockwise, 0 is straight ahead of the listener */
+    BOOL height;
+    BOOL lfe;
+};
+
+/* ordered by speaker mask bit, i.e. by channel position within a stream */
+static const struct speaker_info speaker_info_table[] = {
+    { AudioObjectType_FrontLeft,     SPEAKER_FRONT_LEFT,      -30.0f, FALSE, FALSE },
+    { AudioObjectType_FrontRight,    SPEAKER_FRONT_RIGHT,      30.0f, FALSE, FALSE },
+    { AudioObjectType_FrontCenter,   SPEAKER_FRONT_CENTER,      0.0f, FALSE, FALSE },
+    { AudioObjectType_LowFrequency,  SPEAKER_LOW_FREQUENCY,     0.0f, FALSE, TRUE  },
+    { AudioObjectType_BackLeft,      SPEAKER_BACK_LEFT,      -145.0f, FALSE, FALSE },
+    { AudioObjectType_BackRight,     SPEAKER_BACK_RIGHT,      145.0f, FALSE, FALSE },
+    { AudioObjectType_BackCenter,    SPEAKER_BACK_CENTER,     180.0f, FALSE, FALSE },
+    { AudioObjectType_SideLeft,      SPEAKER_SIDE_LEFT,       -90.0f, FALSE, FALSE },
+    { AudioObjectType_SideRight,     SPEAKER_SIDE_RIGHT,       90.0f, FALSE, FALSE },
+    { AudioObjectType_TopFrontLeft,  SPEAKER_TOP_FRONT_LEFT,  -45.0f, TRUE,  FALSE },
+    { AudioObjectType_TopFrontRight, SPEAKER_TOP_FRONT_RIGHT,  45.0f, TRUE,  FALSE },
+    { AudioObjectType_TopBackLeft,   SPEAKER_TOP_BACK_LEFT,  -135.0f, TRUE,  FALSE },
+    { AudioObjectType_TopBackRight,  SPEAKER_TOP_BACK_RIGHT,  135.0f, TRUE,  FALSE },
+};
+
 typedef struct SpatialAudioImpl SpatialAudioImpl;
 typedef struct SpatialAudioStreamImpl SpatialAudioStreamImpl;
 typedef struct SpatialAudioObjectImpl SpatialAudioObjectImpl;
@@ -123,6 +180,7 @@ struct SpatialAudioImpl {
     IMMDevice *mmdev;
     LONG ref;
     WAVEFORMATEXTENSIBLE object_fmtex;
+    DWORD native_channel_mask;
 };
 
 static inline SpatialAudioObjectImpl *impl_from_ISpatialAudioObject(ISpatialAudioObject *iface)
@@ -594,17 +652,32 @@ static HRESULT WINAPI SAC_GetNativeStaticObjectTypeMask(ISpatialAudioClient *ifa
         AudioObjectType *mask)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%p)\n", This, mask);
-    return E_NOTIMPL;
+    UINT32 native = AudioObjectType_None, i;
+
+    if(!spatial_max_dynamic_objects()){
+        FIXME("(%p)->(%p)\n", This, mask);
+        return E_NOTIMPL;
+    }
+
+    TRACE("(%p)->(%p)\n", This, mask);
+
+    for(i = 0; i < ARRAY_SIZE(speaker_info_table); ++i){
+        if(This->native_channel_mask & speaker_info_table[i].speaker)
+            native |= speaker_info_table[i].type;
+    }
+    *mask = native;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAC_GetMaxDynamicObjectCount(ISpatialAudioClient *iface,
         UINT32 *value)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%p)\n", This, value);
 
-    *value = 0;
+    TRACE("(%p)->(%p)\n", This, value);
+
+    *value = spatial_max_dynamic_objects();
 
     return S_OK;
 }
@@ -660,8 +733,19 @@ static HRESULT WINAPI SAC_IsSpatialAudioStreamAvailable(ISpatialAudioClient *ifa
         REFIID stream_uuid, const PROPVARIANT *info)
 {
     SpatialAudioImpl *This = impl_from_ISpatialAudioClient(iface);
-    FIXME("(%p)->(%s, %p)\n", This, debugstr_guid(stream_uuid), info);
-    return E_NOTIMPL;
+
+    if(!spatial_max_dynamic_objects()){
+        FIXME("(%p)->(%s, %p)\n", This, debugstr_guid(stream_uuid), info);
+        return E_NOTIMPL;
+    }
+
+    TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(stream_uuid), info);
+
+    if(IsEqualIID(stream_uuid, &IID_ISpatialAudioObjectRenderStream))
+        return S_OK;
+
+    FIXME("Stream type %s not supported\n", debugstr_guid(stream_uuid));
+    return SPTLAUDCLNT_E_STREAM_NOT_AVAILABLE;
 }
 
 static WAVEFORMATEX *clone_fmtex(const WAVEFORMATEX *src)
@@ -777,6 +861,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
     TRACE("(%p)->(%s, %p)\n", This, debugstr_guid(riid), stream);
 
     if(IsEqualIID(riid, &IID_ISpatialAudioObjectRenderStream)){
+        UINT32 max_dynamic = spatial_max_dynamic_objects();
         SpatialAudioStreamImpl *obj;
 
         if(prop &&
@@ -805,11 +890,25 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             return AUDCLNT_E_UNSUPPORTED_FORMAT;
         }
 
+        if(max_dynamic){
+            if(params->MinDynamicObjectCount > params->MaxDynamicObjectCount){
+                *stream = NULL;
+                return E_INVALIDARG;
+            }
+            if(params->MinDynamicObjectCount > max_dynamic){
+                WARN("Requested too many dynamic objects: %u\n", params->MinDynamicObjectCount);
+                *stream = NULL;
+                return AUDCLNT_E_UNSUPPORTED_FORMAT;
+            }
+        }
+
         obj = calloc(1, sizeof(SpatialAudioStreamImpl));
 
         obj->ISpatialAudioObjectRenderStream_iface.lpVtbl = &ISpatialAudioObjectRenderStream_vtbl;
         obj->ref = 1;
         memcpy(&obj->params, params, sizeof(obj->params));
+        if(obj->params.MaxDynamicObjectCount > max_dynamic)
+            obj->params.MaxDynamicObjectCount = max_dynamic;
 
         obj->update_frames = ~0;
 
@@ -932,7 +1031,7 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
 {
     SpatialAudioImpl *obj;
     IAudioClient *aclient;
-    WAVEFORMATEX *closest;
+    WAVEFORMATEX *closest, *mix;
     HRESULT hr;
 
     obj = calloc(1, sizeof(*obj));
@@ -956,6 +1055,19 @@ HRESULT SpatialAudioClient_Create(IMMDevice *mmdev, ISpatialAudioClient **out)
         free(obj);
         return hr;
     }
+
+    hr = IAudioClient_GetMixFormat(aclient, &mix);
+    if(SUCCEEDED(hr)){
+        if(mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+            obj->native_channel_mask = ((WAVEFORMATEXTENSIBLE *)mix)->dwChannelMask;
+        else if(mix->nChannels == 1)
+            obj->native_channel_mask = SPEAKER_FRONT_CENTER;
+        CoTaskMemFree(mix);
+    }else{
+        WARN("GetMixFormat failed: %08lx\n", hr);
+    }
+    if(!obj->native_channel_mask)
+        obj->native_channel_mask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
 
     hr = IAudioClient_IsFormatSupported(aclient, AUDCLNT_SHAREMODE_SHARED, &obj->object_fmtex.Format, &closest);
 
