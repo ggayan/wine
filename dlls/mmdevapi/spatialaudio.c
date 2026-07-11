@@ -18,6 +18,7 @@
 
 #define COBJMACROS
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 
@@ -150,6 +151,12 @@ struct SpatialAudioObjectImpl {
 
     BOOL updated;
     BOOL invalidated;
+    BOOL mixed;
+    BOOL dirty;
+    float position[3];
+    float volume;
+    float gain_cur[ARRAY_SIZE(speaker_info_table)];
+    float gain_tgt[ARRAY_SIZE(speaker_info_table)];
 
     float *buf;
 
@@ -372,15 +379,58 @@ static HRESULT WINAPI SAO_SetPosition(ISpatialAudioObject *iface, float x,
         float y, float z)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
-    FIXME("(%p)->(%f, %f, %f)\n", This, x, y, z);
-    return E_NOTIMPL;
+
+    if(!spatial_max_dynamic_objects()){
+        FIXME("(%p)->(%f, %f, %f)\n", This, x, y, z);
+        return E_NOTIMPL;
+    }
+
+    TRACE("(%p)->(%f, %f, %f)\n", This, x, y, z);
+
+    if(This->type != AudioObjectType_Dynamic)
+        return SPTLAUDCLNT_E_PROPERTY_NOT_SUPPORTED;
+
+    EnterCriticalSection(&This->sa_stream->lock);
+
+    if(This->invalidated){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+
+    This->position[0] = x;
+    This->position[1] = y;
+    This->position[2] = z;
+    This->dirty = TRUE;
+
+    LeaveCriticalSection(&This->sa_stream->lock);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAO_SetVolume(ISpatialAudioObject *iface, float vol)
 {
     SpatialAudioObjectImpl *This = impl_from_ISpatialAudioObject(iface);
-    FIXME("(%p)->(%f)\n", This, vol);
-    return E_NOTIMPL;
+
+    if(!spatial_max_dynamic_objects()){
+        FIXME("(%p)->(%f)\n", This, vol);
+        return E_NOTIMPL;
+    }
+
+    TRACE("(%p)->(%f)\n", This, vol);
+
+    EnterCriticalSection(&This->sa_stream->lock);
+
+    if(This->invalidated){
+        LeaveCriticalSection(&This->sa_stream->lock);
+        return SPTLAUDCLNT_E_RESOURCES_INVALIDATED;
+    }
+
+    This->volume = vol < 0.0f ? 0.0f : vol;
+    This->dirty = TRUE;
+
+    LeaveCriticalSection(&This->sa_stream->lock);
+
+    return S_OK;
 }
 
 static ISpatialAudioObjectVtbl ISpatialAudioObject_vtbl = {
@@ -577,10 +627,160 @@ static void mix_static_object(SpatialAudioStreamImpl *stream, SpatialAudioObject
     }
     out = stream->buf + stream->static_object_map[object->static_idx];
     for(i = 0; i < stream->update_frames; ++i){
-        *out += *in;
+        *out += *in * object->volume;
         ++in;
         out += stream->stream_fmtex.Format.nChannels;
     }
+}
+
+/* The listener faces the main (or height) ring of bed speakers from its
+ * center; a ring is described by the azimuth of each speaker. The LFE
+ * channel is not part of any ring and never receives object audio. */
+static void spread_ring(SpatialAudioStreamImpl *stream, BOOL height, float scale, float *gains)
+{
+    WORD c, count = 0, nch = stream->stream_fmtex.Format.nChannels;
+
+    for(c = 0; c < nch; ++c){
+        const struct speaker_info *spk = stream->bed_speakers[c];
+        if(!spk->lfe && spk->height == height)
+            ++count;
+    }
+    if(!count)
+        return;
+
+    /* no meaningful direction, spread the power evenly over the ring */
+    scale /= sqrtf(count);
+    for(c = 0; c < nch; ++c){
+        const struct speaker_info *spk = stream->bed_speakers[c];
+        if(!spk->lfe && spk->height == height)
+            gains[c] += scale;
+    }
+}
+
+static void pan_ring(SpatialAudioStreamImpl *stream, BOOL height, float azimuth,
+        float scale, float *gains)
+{
+    WORD chans[ARRAY_SIZE(speaker_info_table)];
+    float azimuths[ARRAY_SIZE(speaker_info_table)];
+    WORD c, i, j, count = 0, nch = stream->stream_fmtex.Format.nChannels;
+    float a1, a2, f;
+
+    /* collect the ring's channels, sorted by azimuth */
+    for(c = 0; c < nch; ++c){
+        const struct speaker_info *spk = stream->bed_speakers[c];
+        if(spk->lfe || spk->height != height)
+            continue;
+        for(i = 0; i < count; ++i){
+            if(spk->azimuth < azimuths[i])
+                break;
+        }
+        for(j = count; j > i; --j){
+            azimuths[j] = azimuths[j - 1];
+            chans[j] = chans[j - 1];
+        }
+        azimuths[i] = spk->azimuth;
+        chans[i] = c;
+        ++count;
+    }
+
+    if(!count)
+        return;
+    if(count == 1){
+        gains[chans[0]] += scale;
+        return;
+    }
+
+    azimuth = fmodf(azimuth - azimuths[0], 360.0f);
+    if(azimuth < 0.0f)
+        azimuth += 360.0f;
+    azimuth += azimuths[0];
+
+    for(i = 0; i < count; ++i){
+        a1 = azimuths[i];
+        a2 = i + 1 < count ? azimuths[i + 1] : azimuths[0] + 360.0f;
+        if(azimuth <= a2 || i == count - 1){
+            /* constant-power pan between the two nearest speakers */
+            f = a2 > a1 ? (azimuth - a1) / (a2 - a1) : 0.0f;
+            gains[chans[i]] += scale * cosf(f * (float)M_PI / 2.0f);
+            gains[chans[i + 1 < count ? i + 1 : 0]] += scale * sinf(f * (float)M_PI / 2.0f);
+            return;
+        }
+    }
+}
+
+static void compute_dynamic_object_gains(SpatialAudioStreamImpl *stream,
+        SpatialAudioObjectImpl *object, float *gains)
+{
+    /* Windows' spatial sound coordinates are relative to the listener:
+     * +x to the right, +y up, -z ahead */
+    float x = object->position[0], y = object->position[1], z = object->position[2];
+    float radius = sqrtf(x * x + z * z);
+    float main_scale = 1.0f, height_scale = 0.0f;
+    WORD c, nch = stream->stream_fmtex.Format.nChannels;
+    float azimuth, elevation, t;
+
+    for(c = 0; c < nch; ++c)
+        gains[c] = 0.0f;
+
+    /* if the bed has no height channels, elevation is collapsed onto the
+     * main ring instead of splitting the power between the rings */
+    if(stream->has_height && (radius > 0.0f || y > 0.0f)){
+        elevation = atan2f(y, radius);
+        if(elevation > 0.0f){
+            /* the height ring receives all of the power at 45 degrees up */
+            t = elevation / ((float)M_PI / 4.0f);
+            if(t > 1.0f)
+                t = 1.0f;
+            main_scale = cosf(t * (float)M_PI / 2.0f);
+            height_scale = sinf(t * (float)M_PI / 2.0f);
+        }
+    }
+
+    if(radius < 1e-5f){
+        if(main_scale > 0.0f)
+            spread_ring(stream, FALSE, main_scale, gains);
+        if(height_scale > 0.0f)
+            spread_ring(stream, TRUE, height_scale, gains);
+    }else{
+        azimuth = atan2f(x, -z) * 180.0f / (float)M_PI;
+        if(main_scale > 0.0f)
+            pan_ring(stream, FALSE, azimuth, main_scale, gains);
+        if(height_scale > 0.0f)
+            pan_ring(stream, TRUE, azimuth, height_scale, gains);
+    }
+
+    for(c = 0; c < nch; ++c)
+        gains[c] *= object->volume;
+}
+
+static void mix_dynamic_object(SpatialAudioStreamImpl *stream, SpatialAudioObjectImpl *object)
+{
+    WORD c, nch = stream->stream_fmtex.Format.nChannels;
+    float *in = object->buf, *out = stream->buf;
+    float step = 1.0f / stream->update_frames;
+    float f = 0.0f;
+    UINT32 i;
+
+    if(object->dirty){
+        compute_dynamic_object_gains(stream, object, object->gain_tgt);
+        object->dirty = FALSE;
+    }
+
+    /* don't ramp from the initial gains of a freshly activated object */
+    if(!object->mixed)
+        memcpy(object->gain_cur, object->gain_tgt, sizeof(object->gain_cur));
+
+    /* ramp the gains linearly over the update to avoid zipper noise */
+    for(i = 0; i < stream->update_frames; ++i){
+        f += step;
+        for(c = 0; c < nch; ++c)
+            out[c] += *in * (object->gain_cur[c] + (object->gain_tgt[c] - object->gain_cur[c]) * f);
+        ++in;
+        out += nch;
+    }
+
+    memcpy(object->gain_cur, object->gain_tgt, sizeof(object->gain_cur));
+    object->mixed = TRUE;
 }
 
 static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStream *iface)
@@ -608,7 +808,7 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
             if(object->type != AudioObjectType_Dynamic)
                 mix_static_object(This, object);
             else
-                WARN("Don't know how to mix dynamic object yet. %p\n", object);
+                mix_dynamic_object(This, object);
         }
 
         hr = IAudioRenderClient_ReleaseBuffer(This->render, This->update_frames, 0);
@@ -655,6 +855,8 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
     obj->ref = 1;
     obj->type = type;
     obj->updated = TRUE;
+    obj->dirty = TRUE;
+    obj->volume = 1.0f;
     if(type == AudioObjectType_Dynamic){
         obj->static_idx = ~0;
     }else if(type == AudioObjectType_None){
