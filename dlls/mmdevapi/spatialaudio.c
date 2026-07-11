@@ -171,6 +171,9 @@ struct SpatialAudioStreamImpl {
 
     UINT32 static_object_map[17];
 
+    const struct speaker_info *bed_speakers[ARRAY_SIZE(speaker_info_table)];
+    BOOL has_height;
+
     struct list objects;
 };
 
@@ -784,6 +787,52 @@ static void static_mask_to_channels(AudioObjectType static_mask, WORD *count, DW
     CONVERT_MASK(AudioObjectType_BackCenter, SPEAKER_BACK_CENTER);
 }
 
+/* Lay out the stream channels in channel mask bit order, as expected by the
+ * audio backend. When the stream renders dynamic objects the bed is widened
+ * to cover the endpoint's native channels, so that objects can be panned
+ * over the full speaker layout. */
+static void build_stream_channels(SpatialAudioStreamImpl *stream)
+{
+    DWORD bed_mask = 0;
+    WORD count = 0;
+    UINT32 i;
+
+    for(i = 0; i < ARRAY_SIZE(speaker_info_table); ++i){
+        if(stream->params.StaticObjectTypeMask & speaker_info_table[i].type)
+            bed_mask |= speaker_info_table[i].speaker;
+    }
+
+    if(stream->params.MaxDynamicObjectCount > 0){
+        for(i = 0; i < ARRAY_SIZE(speaker_info_table); ++i){
+            if(stream->sa_client->native_channel_mask & speaker_info_table[i].speaker)
+                bed_mask |= speaker_info_table[i].speaker;
+        }
+        if(!(bed_mask & ~SPEAKER_LOW_FREQUENCY))
+            bed_mask |= SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    }
+
+    for(i = 0; i < ARRAY_SIZE(stream->static_object_map); ++i)
+        stream->static_object_map[i] = ~0;
+
+    stream->has_height = FALSE;
+    for(i = 0; i < ARRAY_SIZE(speaker_info_table); ++i){
+        const struct speaker_info *spk = &speaker_info_table[i];
+        if(!(bed_mask & spk->speaker))
+            continue;
+        stream->bed_speakers[count] = spk;
+        if(spk->height)
+            stream->has_height = TRUE;
+        if(stream->params.StaticObjectTypeMask & spk->type){
+            stream->static_object_map[AudioObjectType_to_index(spk->type)] = count;
+            TRACE("mapping 0x%x to %u\n", spk->type, count);
+        }
+        ++count;
+    }
+
+    stream->stream_fmtex.Format.nChannels = count;
+    stream->stream_fmtex.dwChannelMask = bed_mask;
+}
+
 static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
 {
     WAVEFORMATEXTENSIBLE *object_fmtex = (WAVEFORMATEXTENSIBLE *)stream->params.ObjectFormat;
@@ -812,9 +861,12 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
     }
 
     stream->stream_fmtex.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-    static_mask_to_channels(stream->params.StaticObjectTypeMask,
-            &stream->stream_fmtex.Format.nChannels, &stream->stream_fmtex.dwChannelMask,
-            stream->static_object_map);
+    if(spatial_max_dynamic_objects())
+        build_stream_channels(stream);
+    else
+        static_mask_to_channels(stream->params.StaticObjectTypeMask,
+                &stream->stream_fmtex.Format.nChannels, &stream->stream_fmtex.dwChannelMask,
+                stream->static_object_map);
     stream->stream_fmtex.Format.nSamplesPerSec = stream->params.ObjectFormat->nSamplesPerSec;
     stream->stream_fmtex.Format.wBitsPerSample = stream->params.ObjectFormat->wBitsPerSample;
     stream->stream_fmtex.Format.nBlockAlign = (stream->stream_fmtex.Format.nChannels * stream->stream_fmtex.Format.wBitsPerSample) / 8;
