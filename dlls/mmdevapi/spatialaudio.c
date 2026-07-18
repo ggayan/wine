@@ -51,6 +51,16 @@ static UINT32 AudioObjectType_to_index(AudioObjectType type)
     return o - 2;
 }
 
+/* No output format we can open has speakers below the listener; these static
+ * channels are rendered as fixed direction-panned sources instead. */
+static BOOL is_bottom_object(AudioObjectType type)
+{
+    return type == AudioObjectType_BottomFrontLeft ||
+        type == AudioObjectType_BottomFrontRight ||
+        type == AudioObjectType_BottomBackLeft ||
+        type == AudioObjectType_BottomBackRight;
+}
+
 static const char *debugstr_fmtex(const WAVEFORMATEX *fmt)
 {
     static char buf[2048];
@@ -83,9 +93,10 @@ static BOOL formats_equal(const WAVEFORMATEX *fmt1, const WAVEFORMATEX *fmt2)
 
 /* Maximum number of dynamic spatial audio objects. On Windows a non-zero
  * count is only reported when a spatial sound renderer such as Windows Sonic
- * is enabled for the endpoint. WINE_SPATIAL_MAX_DYN overrides the default;
+ * is enabled for the endpoint; current Windows releases report 128 for
+ * Windows Sonic for Headphones. WINE_SPATIAL_MAX_DYN overrides the default;
  * 0 disables dynamic spatial audio support entirely. */
-#define DEFAULT_MAX_DYNAMIC_OBJECTS 112
+#define DEFAULT_MAX_DYNAMIC_OBJECTS 128
 
 static UINT32 spatial_max_dynamic_objects(void)
 {
@@ -853,7 +864,8 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
                 continue;
             }
             if(object->type == AudioObjectType_Dynamic ||
-                    object->type == AudioObjectType_None)
+                    object->type == AudioObjectType_None ||
+                    is_bottom_object(object->type))
                 mix_dynamic_object(This, object);
             else
                 mix_static_object(This, object);
@@ -921,6 +933,14 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
         obj->static_idx = ~0;
     }else{
         obj->static_idx = AudioObjectType_to_index(type);
+    }
+
+    if(is_bottom_object(type)){
+        obj->position[0] = (type == AudioObjectType_BottomFrontLeft ||
+                type == AudioObjectType_BottomBackLeft) ? -0.707f : 0.707f;
+        obj->position[1] = -1.0f;
+        obj->position[2] = (type == AudioObjectType_BottomFrontLeft ||
+                type == AudioObjectType_BottomFrontRight) ? -0.707f : 0.707f;
     }
 
     obj->sa_stream = This;
@@ -1137,6 +1157,12 @@ static void static_mask_to_channels(AudioObjectType static_mask, WORD *count, DW
     CONVERT_MASK(AudioObjectType_TopFrontRight, SPEAKER_TOP_FRONT_RIGHT);
     CONVERT_MASK(AudioObjectType_TopBackLeft, SPEAKER_TOP_BACK_LEFT);
     CONVERT_MASK(AudioObjectType_TopBackRight, SPEAKER_TOP_BACK_RIGHT);
+    /* the four Bottom* types have no channel mask equivalent, but their map
+     * slots must be skipped to keep BackCenter's index aligned */
+    map[map_idx++] = ~0;
+    map[map_idx++] = ~0;
+    map[map_idx++] = ~0;
+    map[map_idx++] = ~0;
     CONVERT_MASK(AudioObjectType_BackCenter, SPEAKER_BACK_CENTER);
 }
 
