@@ -153,6 +153,7 @@ struct SpatialAudioObjectImpl {
     BOOL invalidated;
     BOOL mixed;
     BOOL dirty;
+    BOOL lifetime_started;
     float position[3];
     float volume;
     float gain_cur[ARRAY_SIZE(speaker_info_table)];
@@ -183,6 +184,7 @@ struct SpatialAudioStreamImpl {
 
     const struct speaker_info *bed_speakers[ARRAY_SIZE(speaker_info_table)];
     BOOL has_height;
+    BOOL started;
     UINT32 active_dynamic_count;
 
     struct list objects;
@@ -298,7 +300,9 @@ static HRESULT WINAPI SAO_GetBuffer(ISpatialAudioObject *iface,
         return SPTLAUDCLNT_E_OUT_OF_ORDER;
     }
 
+    /* the object's lifetime starts at its first GetBuffer */
     This->updated = TRUE;
+    This->lifetime_started = TRUE;
 
     *buffer = (BYTE *)This->buf;
     *bytes = This->sa_stream->update_frames *
@@ -541,6 +545,10 @@ static HRESULT WINAPI SAORS_Start(ISpatialAudioObjectRenderStream *iface)
         return hr;
     }
 
+    EnterCriticalSection(&This->lock);
+    This->started = TRUE;
+    LeaveCriticalSection(&This->lock);
+
     /* The Windows pipeline requests the first update as soon as the stream
      * starts; the period timer's first tick can be up to a period away, and
      * some clients treat an event that late as a dead stream. */
@@ -562,14 +570,42 @@ static HRESULT WINAPI SAORS_Stop(ISpatialAudioObjectRenderStream *iface)
         return hr;
     }
 
+    EnterCriticalSection(&This->lock);
+    This->started = FALSE;
+    LeaveCriticalSection(&This->lock);
+
     return S_OK;
 }
 
 static HRESULT WINAPI SAORS_Reset(ISpatialAudioObjectRenderStream *iface)
 {
     SpatialAudioStreamImpl *This = impl_from_ISpatialAudioObjectRenderStream(iface);
-    FIXME("(%p)->()\n", This);
-    return E_NOTIMPL;
+    SpatialAudioObjectImpl *object;
+
+    if(!spatial_max_dynamic_objects()){
+        FIXME("(%p)->()\n", This);
+        return E_NOTIMPL;
+    }
+
+    TRACE("(%p)->()\n", This);
+
+    EnterCriticalSection(&This->lock);
+
+    if(This->started){
+        LeaveCriticalSection(&This->lock);
+        return SPTLAUDCLNT_E_STREAM_NOT_STOPPED;
+    }
+
+    /* flush pending data and revoke all active objects */
+    LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry)
+        invalidate_object(object);
+    This->update_frames = ~0;
+
+    LeaveCriticalSection(&This->lock);
+
+    IAudioClient_Reset(This->client);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderStream *iface,
@@ -810,14 +846,17 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
     if(This->update_frames > 0){
         LIST_FOR_EACH_ENTRY(object, &This->objects, SpatialAudioObjectImpl, entry){
             if(spatial_max_dynamic_objects() && !object->updated){
-                /* objects which miss an update cycle are invalidated */
-                invalidate_object(object);
+                /* objects which miss an update cycle after their lifetime has
+                 * started are deactivated; never-fed objects stay dormant */
+                if(object->lifetime_started)
+                    invalidate_object(object);
                 continue;
             }
-            if(object->type != AudioObjectType_Dynamic)
-                mix_static_object(This, object);
-            else
+            if(object->type == AudioObjectType_Dynamic ||
+                    object->type == AudioObjectType_None)
                 mix_dynamic_object(This, object);
+            else
+                mix_static_object(This, object);
         }
 
         hr = IAudioRenderClient_ReleaseBuffer(This->render, This->update_frames, 0);
@@ -878,7 +917,7 @@ static HRESULT WINAPI SAORS_ActivateSpatialAudioObject(ISpatialAudioObjectRender
     if(type == AudioObjectType_Dynamic){
         obj->static_idx = ~0;
     }else if(type == AudioObjectType_None){
-        FIXME("AudioObjectType_None not implemented yet!\n");
+        /* rendered without spatialization: mixed evenly over the main ring */
         obj->static_idx = ~0;
     }else{
         obj->static_idx = AudioObjectType_to_index(type);
@@ -1236,9 +1275,9 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
         UINT32 max_dynamic = spatial_max_dynamic_objects();
         SpatialAudioStreamImpl *obj;
 
-        if(prop &&
-                (prop->vt != VT_BLOB ||
-                 prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams))){
+        if(!prop || prop->vt != VT_BLOB ||
+                prop->blob.cbSize != sizeof(SpatialAudioObjectRenderStreamActivationParams) ||
+                !prop->blob.pBlobData){
             WARN("Got invalid params\n");
             *stream = NULL;
             return E_INVALIDARG;
@@ -1270,7 +1309,7 @@ static HRESULT WINAPI SAC_ActivateSpatialAudioStream(ISpatialAudioClient *iface,
             if(params->MinDynamicObjectCount > max_dynamic){
                 WARN("Requested too many dynamic objects: %u\n", params->MinDynamicObjectCount);
                 *stream = NULL;
-                return AUDCLNT_E_UNSUPPORTED_FORMAT;
+                return SPTLAUDCLNT_E_NO_MORE_OBJECTS;
             }
         }
 
