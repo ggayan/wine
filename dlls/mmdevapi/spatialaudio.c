@@ -174,7 +174,7 @@ struct SpatialAudioStreamImpl {
     IAudioClient *client;
     IAudioRenderClient *render;
 
-    UINT32 period_frames, update_frames;
+    UINT32 period_frames, update_frames, buffer_frames;
     WAVEFORMATEXTENSIBLE stream_fmtex;
 
     float *buf;
@@ -541,6 +541,11 @@ static HRESULT WINAPI SAORS_Start(ISpatialAudioObjectRenderStream *iface)
         return hr;
     }
 
+    /* The Windows pipeline requests the first update as soon as the stream
+     * starts; the period timer's first tick can be up to a period away, and
+     * some clients treat an event that late as a dead stream. */
+    SetEvent(This->params.EventHandle);
+
     return S_OK;
 }
 
@@ -814,6 +819,15 @@ static HRESULT WINAPI SAORS_EndUpdatingAudioObjects(ISpatialAudioObjectRenderStr
         hr = IAudioRenderClient_ReleaseBuffer(This->render, This->update_frames, 0);
         if(FAILED(hr))
             WARN("ReleaseBuffer failed: %08lx\n", hr);
+
+        /* Windows keeps requesting updates back to back until the stream
+         * buffer is full; only then does pacing fall to the period clock. */
+        if(SUCCEEDED(hr)){
+            UINT32 pad = 0;
+            if(SUCCEEDED(IAudioClient_GetCurrentPadding(This->client, &pad)) &&
+                    pad + This->period_frames <= This->buffer_frames)
+                SetEvent(This->params.EventHandle);
+        }
     }
 
     This->update_frames = ~0;
@@ -1195,6 +1209,12 @@ static HRESULT activate_stream(SpatialAudioStreamImpl *stream)
     }
 
     stream->period_frames = MulDiv(period, stream->stream_fmtex.Format.nSamplesPerSec, 10000000);
+
+    hr = IAudioClient_GetBufferSize(stream->client, &stream->buffer_frames);
+    if(FAILED(hr)){
+        WARN("GetBufferSize failed: %08lx\n", hr);
+        stream->buffer_frames = 3 * stream->period_frames;
+    }
 
     return S_OK;
 }
