@@ -610,8 +610,12 @@ static HRESULT WINAPI SAORS_BeginUpdatingAudioObjects(ISpatialAudioObjectRenderS
         FIXME("Zero frame update.\n");
     }
 
+    /* Unlike GetAvailableDynamicObjectCount, this reports how many dynamic
+     * objects can be rendered in this pass, not the remaining activation
+     * headroom. We render every activated object each pass, so the whole
+     * budget is always available; engines treat 0 as a dead renderer. */
     if(spatial_max_dynamic_objects())
-        *dyn_count = This->params.MaxDynamicObjectCount - This->active_dynamic_count;
+        *dyn_count = This->params.MaxDynamicObjectCount;
     else
         *dyn_count = 0;
     *frames = This->update_frames;
